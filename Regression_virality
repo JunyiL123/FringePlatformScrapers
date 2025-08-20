@@ -1,0 +1,381 @@
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+import pandas as pd
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+from scipy.stats import f_oneway, ttest_ind
+from itertools import combinations
+
+def extract_virality_data_by_identity():
+    """Extract main post hate intensity, average reply hate intensity, and virality for all platforms, separated by racial identity groups"""
+    racial_groups = ["african_americans", "east_asian", "south_asian", "latino", "jewish"]
+    platforms = ["4chan", "gab", "stormfront", "vanguard"]
+    thread_data = {p: [] for p in platforms}
+
+    # 4chan
+    with open("4chan_data.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+    total = len(data)
+    has_hate = sum(1 for thread in data if thread.get("hate_intensity") is not None)
+    has_virality = sum(1 for thread in data if thread.get("virality_score") is not None)
+    has_both = sum(1 for thread in data if thread.get("hate_intensity") is not None and thread.get("virality_score") is not None)
+    print(f"4chan: total={total}, hate_intensity={has_hate}, virality_score={has_virality}, both={has_both}")
+    for thread in data:
+        main_hate = thread.get("hate_intensity")
+        virality = thread.get("virality_score")
+        avg_reply_hate = thread.get("average_reply_hate_intensity")
+        tags = thread.get("tag", [])
+        thread_data["4chan"].append({"main_hate": main_hate, "virality": virality, "tag": tags, "average_reply_hate_intensity": avg_reply_hate})
+
+    # gab
+    with open("gab_data.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+    total = len(data)
+    has_hate = sum(1 for thread in data if thread.get("hate_intensity") is not None)
+    has_virality = sum(1 for thread in data if thread.get("virality_score") is not None)
+    has_both = sum(1 for thread in data if thread.get("hate_intensity") is not None and thread.get("virality_score") is not None)
+    print(f"gab: total={total}, hate_intensity={has_hate}, virality_score={has_virality}, both={has_both}")
+    for thread in data:
+        main_hate = thread.get("hate_intensity")
+        virality = thread.get("virality_score")
+        avg_reply_hate = thread.get("average_reply_hate_intensity")
+        tags = thread.get("tag", [])
+        thread_data["gab"].append({"main_hate": main_hate, "virality": virality, "tag": tags, "average_reply_hate_intensity": avg_reply_hate})
+
+    # stormfront
+    with open("revolution_stormfront.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+    total = len(data)
+    has_hate = 0
+    has_virality = 0
+    has_both = 0
+    for thread in data.values():
+        main_hate = None
+        if thread.get("scraped_replies") and len(thread["scraped_replies"]) > 0:
+            main_hate = thread["scraped_replies"][0].get("hate_intensity")
+        virality = thread.get("virality_score")
+        avg_reply_hate = thread.get("average_reply_hate_intensity")
+        if main_hate is not None:
+            has_hate += 1
+        if virality is not None:
+            has_virality += 1
+        if main_hate is not None and virality is not None:
+            has_both += 1
+        tags = thread.get("tag", [])
+        thread_data["stormfront"].append({"main_hate": main_hate, "virality": virality, "tag": tags, "average_reply_hate_intensity": avg_reply_hate})
+    print(f"stormfront: total={total}, hate_intensity={has_hate}, virality_score={has_virality}, both={has_both}")
+
+    # vanguard
+    with open("revolution_vanguard.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+    total = len(data)
+    has_hate = 0
+    has_virality = 0
+    has_both = 0
+    for thread in data.values():
+        main_hate = None
+        if thread.get("scraped_replies") and len(thread["scraped_replies"]) > 0:
+            main_hate = thread["scraped_replies"][0].get("hate_intensity")
+        virality = thread.get("virality_score")
+        avg_reply_hate = thread.get("average_reply_hate_intensity")
+        if main_hate is not None:
+            has_hate += 1
+        if virality is not None:
+            has_virality += 1
+        if main_hate is not None and virality is not None:
+            has_both += 1
+        tags = thread.get("tag", [])
+        thread_data["vanguard"].append({"main_hate": main_hate, "virality": virality, "tag": tags, "average_reply_hate_intensity": avg_reply_hate})
+    print(f"vanguard: total={total}, hate_intensity={has_hate}, virality_score={has_virality}, both={has_both}")
+
+    return thread_data
+
+
+def regression_and_print_tsv(thread_data):
+    platform_names = ["4chan", "gab", "stormfront", "vanguard"]
+    racial_groups = ["african_americans", "east_asian", "south_asian", "latino", "jewish"]
+    colors = {
+        'african_americans': '#1f77b4', 'east_asian': '#ff7f0e', 'south_asian': '#2ca02c', 
+        'latino': '#d62728', 'jewish': '#9467bd', 'combined': '#222222', 'other': '#8c564b'
+    }
+    apa_stats = []
+    for platform in platform_names:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        has_data = False
+        group_data = {g: {'x': [], 'y': []} for g in racial_groups + ["other"]}
+        group_data['combined'] = {'x': [], 'y': []}
+        for thread in thread_data[platform]:
+            tags = thread.get('tag', [])
+            main_hate = thread.get('main_hate')
+            virality = thread.get('virality')
+            if main_hate is None or virality is None:
+                continue
+            racial_tags = [t for t in tags if t in racial_groups]
+            if not racial_tags:
+                group_data['other']['x'].append(main_hate)
+                group_data['other']['y'].append(virality)
+            else:
+                for t in racial_tags:
+                    group_data[t]['x'].append(main_hate)
+                    group_data[t]['y'].append(virality)
+                group_data['combined']['x'].append(main_hate)
+                group_data['combined']['y'].append(virality)
+        for group in racial_groups + ["other", "combined"]:
+            x = group_data[group]['x']
+            y = group_data[group]['y']
+            if x and len(x) > 1:
+                has_data = True
+                slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+                x_vals = np.array([min(x), max(x)])
+                y_vals = intercept + slope * x_vals
+                ax.plot(x_vals, y_vals, color=colors.get(group, '#000000'), 
+                       linestyle='-', linewidth=2 if group != 'combined' else 3, 
+                       label=f'{group.replace("_", " ").title()}')
+                n = len(x)
+                p = 1
+                r2 = float(r_value) ** 2
+                adj_r2 = 1 - (1 - r2) * (n - 1) / (n - p - 1) if n > 2 else r2
+                effect_size_r = abs(r_value)
+                effect_size_f2 = r2 / (1 - r2) if r2 < 1 else float('inf')
+                apa_stats.append({
+                    'Platform': platform,
+                    'Group': group,
+                    'n': n,
+                    'Slope (b)': slope,
+                    'Intercept (a)': intercept,
+                    'R²': r2,
+                    'Adjusted R²': adj_r2,
+                    'p': p_value,
+                    '|r|': effect_size_r,
+                    "Cohen's f²": effect_size_f2
+                })
+        if not has_data:
+            ax.text(0.5, 0.5, f'No data for {platform}', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'{platform.upper()}', fontsize=14)
+            plt.show()
+            continue
+        ax.set_title(f'{platform.upper()}: Main Post Hate Intensity vs. Virality', fontsize=16)
+        ax.set_xlabel('Main Post Hate Intensity', fontsize=14)
+        ax.set_ylabel('Virality Metric', fontsize=14)
+        ax.legend(fontsize=10, loc='best')
+        plt.tight_layout()
+        plt.show()
+    # Print as Excel file
+    if apa_stats:
+        df = pd.DataFrame(apa_stats)
+        df['Slope (b)'] = df['Slope (b)'].map(lambda x: f"{x:.2f}")
+        df['Intercept (a)'] = df['Intercept (a)'].map(lambda x: f"{x:.2f}")
+        df['R²'] = df['R²'].map(lambda x: f"{x:.2f}")
+        df['Adjusted R²'] = df['Adjusted R²'].map(lambda x: f"{x:.2f}")
+        df['p'] = df['p'].map(lambda x: f"{x:.3f}")
+        df['|r|'] = df['|r|'].map(lambda x: f"{x:.2f}")
+        df["Cohen's f²"] = df["Cohen's f²"].map(lambda x: f"{x:.2f}" if x != float('inf') else 'inf')
+        df['n'] = df['n'].astype(int)
+        excel_path = 'regression_stats_virality.xlsx'
+        df.to_excel(excel_path, index=False)
+        print(f"\nAPA-Formatted Regression Statistics Table (Virality vs. Hate Intensity) saved as: {excel_path}\nYou can open this file in Excel or upload to Google Sheets for proper table formatting.")
+
+
+def ancova_compare_slopes(thread_data, platform):
+    # Prepare data
+    rows = []
+    racial_groups = ["african_americans", "east_asian", "south_asian", "latino", "jewish"]
+    for thread in thread_data[platform]:
+        main_hate = thread.get('main_hate')
+        virality = thread.get('virality')
+        tags = thread.get('tag', [])
+        for group in racial_groups:
+            if main_hate is not None and virality is not None and group in tags:
+                rows.append({
+                    'main_hate': main_hate,
+                    'virality': virality,
+                    'group': group
+                })
+    df = pd.DataFrame(rows)
+    print(f"\n{platform.upper()} ANCOVA: {len(df)} thread-group pairs (multi-tagged threads included)")
+    if len(df) < 10:
+        print("Not enough data for ANCOVA.")
+        return
+    # Fit ANCOVA model
+    model = smf.ols('virality ~ main_hate * group', data=df).fit()
+    anova_table = sm.stats.anova_lm(model, typ=2)
+    print(anova_table)
+    # Look at the p-value for main_hate:group
+    print("\nInteraction p-value (main_hate:group):", anova_table.loc['main_hate:group', 'PR(>F)'])
+    if anova_table.loc['main_hate:group', 'PR(>F)'] < 0.05:
+        print("=> Slopes are significantly different between groups.")
+    else:
+        print("=> No significant difference in slopes between groups.")
+
+
+def anova_and_posthoc(df, platform, label):
+    print(f"\n### {platform.upper()} {label.upper()} ANOVA")
+    groups = df['group'].unique()
+    group_data = [df[df['group'] == g]['hate_intensity'].dropna() for g in groups]
+    # ANOVA
+    fval, pval = f_oneway(*group_data)
+    print(f"ANOVA F = {fval:.3f}, p = {pval:.4f}")
+    if pval < 0.05:
+        print("**Significant differences found. Pairwise t-tests (Bonferroni-corrected):**")
+        results = []
+        for g1, g2 in combinations(groups, 2):
+            d1 = df[df['group'] == g1]['hate_intensity'].dropna()
+            d2 = df[df['group'] == g2]['hate_intensity'].dropna()
+            tval, p = ttest_ind(d1, d2, equal_var=False)
+            results.append((g1, g2, p))
+        # Bonferroni correction
+        alpha = 0.05 / len(results)
+        print("| Group 1 | Group 2 | p-value | Significant? |")
+        print("|---------|---------|---------|--------------|")
+        for g1, g2, p in results:
+            sig = "**Yes**" if p < alpha else "No"
+            print(f"| {g1} | {g2} | {p:.4g} | {sig} |")
+    else:
+        print("No significant differences between groups.")
+
+
+def ancova_main_vs_reply(thread_data, platform):
+    rows = []
+    racial_groups = ["african_americans", "east_asian", "south_asian", "latino", "jewish"]
+    for thread in thread_data[platform]:
+        main_hate = thread.get('main_hate')
+        avg_reply_hate = thread.get('average_reply_hate_intensity')
+        tags = thread.get('tag', [])
+        for group in racial_groups:
+            if main_hate is not None and avg_reply_hate is not None and group in tags:
+                rows.append({'main_hate': main_hate, 'avg_reply_hate': avg_reply_hate, 'group': group})
+    df = pd.DataFrame(rows)
+    print(f"\n#### {platform.upper()} ANCOVA: Main Post vs. Average Reply Hate Intensity")
+    if len(df) < 10:
+        print("Not enough data for ANCOVA.")
+        return
+    model = smf.ols('avg_reply_hate ~ main_hate * group', data=df).fit()
+    anova_table = sm.stats.anova_lm(model, typ=2)
+    # Markdown table
+    print("| Source | sum_sq | df | F | PR(>F) |")
+    print("|--------|--------|----|---|--------|")
+    for idx, row in anova_table.iterrows():
+        print(f"| {idx} | {row['sum_sq']:.4f} | {row['df']:.1f} | {row['F'] if not pd.isna(row['F']) else ''} | {row['PR(>F)'] if not pd.isna(row['PR(>F)']) else ''} |")
+    pval = anova_table.loc['main_hate:group', 'PR(>F)']
+    print(f"\nInteraction p-value (main_hate:group): {pval:.4g}")
+    if pval < 0.05:
+        print("=> Slopes are significantly different between groups.")
+    else:
+        print("=> No significant difference in slopes between groups.")
+
+def anova_virality(thread_data, platform):
+    rows = []
+    racial_groups = ["african_americans", "east_asian", "south_asian", "latino", "jewish"]
+    for thread in thread_data[platform]:
+        virality = thread.get('virality')
+        tags = thread.get('tag', [])
+        for group in racial_groups:
+            if virality is not None and group in tags:
+                rows.append({'group': group, 'virality': virality})
+    df = pd.DataFrame(rows)
+    print(f"\n#### {platform.upper()} ANOVA: Virality Score by Group")
+    if len(df) < 10:
+        print("Not enough data for ANOVA.")
+        return
+    groups = df['group'].unique()
+    group_data = [df[df['group'] == g]['virality'].dropna() for g in groups]
+    fval, pval = f_oneway(*group_data)
+    print(f"ANOVA F = {fval:.3f}, p = {pval:.4g}")
+    if pval < 0.05:
+        print("**Significant differences found. Pairwise t-tests (Bonferroni-corrected):**")
+        results = []
+        for g1, g2 in combinations(groups, 2):
+            d1 = df[df['group'] == g1]['virality'].dropna()
+            d2 = df[df['group'] == g2]['virality'].dropna()
+            tval, p = ttest_ind(d1, d2, equal_var=False)
+            results.append((g1, g2, p))
+        alpha = 0.05 / len(results)
+        print("| Group 1 | Group 2 | p-value | Significant? |")
+        print("|---------|---------|---------|--------------|")
+        for g1, g2, p in results:
+            sig = "**Yes**" if p < alpha else "No"
+            print(f"| {g1} | {g2} | {p:.4g} | {sig} |")
+    else:
+        print("No significant differences between groups.")
+
+
+def pairwise_slope_tests(thread_data, platform):
+    rows = []
+    racial_groups = ["african_americans", "east_asian", "south_asian", "latino", "jewish"]
+    for thread in thread_data[platform]:
+        main_hate = thread.get('main_hate')
+        avg_reply_hate = thread.get('average_reply_hate_intensity')
+        tags = thread.get('tag', [])
+        for group in racial_groups:
+            if main_hate is not None and avg_reply_hate is not None and group in tags:
+                rows.append({'main_hate': main_hate, 'avg_reply_hate': avg_reply_hate, 'group': group})
+    df = pd.DataFrame(rows)
+    results = []
+    from itertools import combinations
+    for g1, g2 in combinations(racial_groups, 2):
+        sub = df[df['group'].isin([g1, g2])].copy()
+        if len(sub) < 10:
+            continue
+        sub['group'] = sub['group'].astype('category')
+        model = smf.ols('avg_reply_hate ~ main_hate * group', data=sub).fit()
+        anova_table = sm.stats.anova_lm(model, typ=2)
+        pval = anova_table.loc['main_hate:group', 'PR(>F)']
+        results.append((g1, g2, pval))
+    # Bonferroni correction
+    alpha = 0.05 / len(results) if results else 0.05
+    print("\n#### Stormfront Pairwise ANCOVA Slope Tests (Main Post vs. Average Reply Hate Intensity)")
+    print("| Group 1 | Group 2 | p-value | Significant? |")
+    print("|---------|---------|---------|--------------|")
+    for g1, g2, p in results:
+        sig = "**Yes**" if p < alpha else "No"
+        print(f"| {g1} | {g2} | {p:.4g} | {sig} |")
+
+
+def main():
+    print("Extracting virality and hate intensity data by identity group...")
+    thread_data = extract_virality_data_by_identity()
+    print("\nCreating regression plots and APA table for virality vs. hate intensity...")
+    regression_and_print_tsv(thread_data)
+    # ANCOVA for each platform
+    for platform in ["4chan", "gab", "stormfront", "vanguard"]:
+        ancova_compare_slopes(thread_data, platform)
+
+    # ANOVA and Pairwise t-tests for main post and average reply hate intensity
+    main_rows = []
+    reply_rows = []
+    for platform in ["4chan", "gab", "stormfront", "vanguard"]:
+        for thread in thread_data[platform]:
+            main_hate = thread.get('main_hate')
+            avg_reply_hate = thread.get('average_reply_hate_intensity')
+            tags = thread.get('tag', [])
+            for group in ["african_americans", "east_asian", "south_asian", "latino", "jewish"]:
+                if main_hate is not None and group in tags:
+                    main_rows.append({'platform': platform, 'group': group, 'hate_intensity': main_hate})
+                if avg_reply_hate is not None and group in tags:
+                    reply_rows.append({'platform': platform, 'group': group, 'hate_intensity': avg_reply_hate})
+    main_all = pd.DataFrame(main_rows)
+    reply_all = pd.DataFrame(reply_rows)
+    # Run ANOVA and posthoc for each platform and type
+    for platform in ["4chan", "gab", "stormfront", "vanguard"]:
+        anova_and_posthoc(main_all[main_all['platform'] == platform], platform, 'main')
+        if 'platform' in reply_all.columns:
+            df = reply_all[reply_all['platform'] == platform]
+            if not df.empty:
+                anova_and_posthoc(df, platform, 'reply')
+            else:
+                print(f"No reply data for {platform}")
+        else:
+            print("No reply data available at all.")
+
+    # ANCOVA and ANOVA analyses
+    for platform in ["4chan", "gab", "stormfront", "vanguard"]:
+        ancova_main_vs_reply(thread_data, platform)
+        anova_virality(thread_data, platform)
+    # Pairwise ANCOVA slope tests for Stormfront
+    pairwise_slope_tests(thread_data, "stormfront")
+
+
+if __name__ == "__main__":
+    main() 
