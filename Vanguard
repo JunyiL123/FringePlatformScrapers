@@ -1,0 +1,544 @@
+import undetected_chromedriver as uc
+from bs4 import BeautifulSoup, Tag
+import time
+import json
+import re
+import os
+from datetime import datetime, timedelta
+from selenium.common.exceptions import NoSuchWindowException, WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import threading
+
+START_URL = "https://vnnforum.com/forumdisplay.php?f=57"
+OUTPUT_FILE = "revolution_vanguard.json"
+PROGRESS_FILE = "scraping_progress_vanguard.json"
+# Load existing data if available
+if os.path.exists(OUTPUT_FILE):
+    with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
+        all_data = json.load(f)
+else:
+    all_data = {}
+
+# Track the next thread number - find the highest existing number
+if all_data:
+    existing_numbers = [int(k) for k in all_data.keys() if k.isdigit()]
+    next_thread_number = max(existing_numbers) + 1 if existing_numbers else 1
+else:
+    next_thread_number = 1
+
+print(f"[INFO] Resuming from thread number {next_thread_number}. Total threads already scraped: {len(all_data)}")
+
+def load_progress():
+    try:
+        if os.path.exists(PROGRESS_FILE):
+            with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
+                progress = json.load(f)
+                print(f"[INFO] Loaded progress: {progress['last_forum_url']}, {len(progress['visited_pages'])} pages")
+                return progress
+        else:
+            print(f"[INFO] No progress file found at {PROGRESS_FILE}, starting fresh")
+    except Exception as e:
+        print(f"[ERROR] Failed to load progress: {e}")
+    return {"last_forum_url": START_URL, "visited_pages": []}
+
+def save_progress(forum_url, visited_pages):
+    try:
+        progress = {
+            "last_forum_url": forum_url,
+            "visited_pages": list(visited_pages)
+        }
+        with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(progress, f, ensure_ascii=False, indent=2)
+        print(f"[INFO] Progress saved: {forum_url}, {len(visited_pages)} pages visited")
+    except Exception as e:
+        print(f"[ERROR] Failed to save progress: {e}")
+
+def make_new_driver():
+    options = uc.ChromeOptions()
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1920,1080')
+    return uc.Chrome(options=options, version_main=None)
+
+driver = make_new_driver()
+
+def save_data():
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(all_data, f, ensure_ascii=False, indent=2)
+    print(f"[INFO] Saved {len(all_data)} threads to {OUTPUT_FILE}")
+
+def scrape_thread(thread_url, max_replies=20):
+    global driver
+    main_post = None
+    main_post_images = []
+    replies = []
+    reply_images = []
+    page_url = thread_url
+    thread_end = False
+    soup = None
+    try:
+        while len(replies) < max_replies and page_url:
+            try:
+                safe_get(page_url)
+                wait_for_element(By.CSS_SELECTOR, "table[id^='post']")
+                soup = BeautifulSoup(driver.page_source, 'html.parser')
+            except Exception as e:
+                print(f"Error accessing {page_url}: {e}")
+                print("[INFO] Attempting to restart browser for thread scraping...")
+                try:
+                    driver.quit()
+                except:
+                    pass
+                # Recreate driver
+                driver = make_new_driver()
+                try:
+                    safe_get(page_url)
+                    wait_for_element(By.CSS_SELECTOR, "table[id^='post']")
+                    soup = BeautifulSoup(driver.page_source, 'html.parser')
+                except Exception as e2:
+                    print(f"Error restarting browser for thread: {e2}")
+                    break
+
+            posts = soup.select('table[id^="post"]')
+            print(f"[DEBUG] Found {len(posts)} posts on page: {page_url}")
+            if not posts:
+                print("[DEBUG] No posts found. Page source snippet:")
+                print(driver.page_source[:1000])  # Print first 1000 chars
+            else:
+                for idx, post in enumerate(posts):
+                    post_text = post.find('div', id=re.compile(r'^post_message_'))
+                    if post_text:
+                        cleaned_text = ' '.join(post_text.stripped_strings)
+                        images = post_text.find_all('img')  # type: ignore
+                        image_urls = []
+                        for img in images:
+                            src = img.get('src') if hasattr(img, 'get') else None  # type: ignore
+                            if src and isinstance(src, str):
+                                if not src.startswith('http'):
+                                    src = "https://vnnforum.com/" + src.lstrip('/')
+                                if not src.endswith('viewpost.gif'):
+                                    image_urls.append(src)
+                        if idx == 0 and main_post is None:
+                            main_post = cleaned_text
+                            main_post_images = image_urls
+                        else:
+                            if cleaned_text.strip():
+                                if len(replies) < max_replies:
+                                    replies.append(cleaned_text)
+                                    reply_images.append(image_urls)
+                    else:
+                        print(f"[DEBUG] Post {idx} - No post_text found with selector 'div[id^=post_message_']")
+            if len(replies) >= max_replies:
+                break
+            # Find the next page link (">")
+            next_page = soup.find('a', string=">")
+            if next_page and len(replies) < max_replies:
+                href_attr = next_page.get('href')  # type: ignore
+                if href_attr:
+                    page_url = str(href_attr)
+                    if not page_url.startswith('http'):
+                        page_url = "https://vnnforum.com/" + page_url.lstrip('/')
+            else:
+                page_url = None
+                thread_end = True
+    except Exception as e:
+        print(f"[ERROR] Exception in scrape_thread: {e}")
+    finally:
+        pass
+    return {
+        "main_post": {"text": main_post, "image_urls": main_post_images},
+        "replies": [
+            {"text": r, "image_urls": imgs} for r, imgs in zip(replies, reply_images)
+        ]
+    }
+
+def scrape_thread_with_timeout(thread_url, max_replies=20, timeout=60):
+    """
+    Run scrape_thread with a timeout. If it takes longer than 'timeout' seconds, abort and return None.
+    """
+    result = {}
+    def target():
+        nonlocal result
+        result = scrape_thread(thread_url, max_replies)
+    thread = threading.Thread(target=target)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        print(f"[WARNING] Scraping thread {thread_url} exceeded {timeout} seconds. Skipping to next thread.")
+        return None
+    return result
+
+def get_next_page_url(soup):
+    next_page = soup.find('a', string='>')
+    if next_page and next_page.get('href'):  # type: ignore
+        href = next_page.get('href')  # type: ignore
+        if not href.startswith('http'):
+            href = "https://vnnforum.com/" + href.lstrip('/')
+        return href
+    return None
+
+def extract_post_date(row):
+    try:
+        date_cell = row.find_all('td')[4]  # 5th column (0-indexed)
+        date_text = date_cell.get_text(strip=True)
+        if "Yesterday" in date_text or "Today" in date_text:
+            return None
+        date_match = re.search(r'(\d{1,2})-(\d{1,2})-(\d{2,4})', date_text)
+        if date_match:
+            month, day, year = date_match.groups()
+            if len(year) == 2:
+                year = "20" + year if int(year) < 50 else "19" + year
+            return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+    except Exception as e:
+        print(f"[DEBUG] Could not extract date: {e}")
+    return None
+
+def extract_main_post_date_from_thread(soup):
+    try:
+        # Find all <td class="thead"> elements
+        date_tds = soup.find_all('td', class_='thead')
+        for date_td in date_tds:
+            date_text = date_td.get_text(strip=True)
+            # Look for a date like "January 23rd, 2014"
+            date_match = re.search(r'([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,\s*(\d{4})', date_text)
+            if date_match:
+                month_str, day, year = date_match.groups()
+                from datetime import datetime
+                month = datetime.strptime(month_str, '%B').month
+                return f"{year}-{month:02d}-{int(day):02d}"
+        # If no date found, print all thead HTML for debugging
+        print("[DEBUG] No main post date found. thead HTML candidates:")
+        for date_td in date_tds:
+            print(date_td)
+    except Exception as e:
+        print(f"[DEBUG] Could not extract main post date from thread: {e}")
+    return None
+
+def is_thread_old_enough(post_date):
+    if not post_date:
+        return False
+    try:
+        post_datetime = datetime.strptime(post_date, "%Y-%m-%d")
+        two_weeks_ago = datetime.now() - timedelta(days=14)
+        return post_datetime <= two_weeks_ago
+    except Exception as e:
+        print(f"[DEBUG] Error comparing dates: {e}")
+        return False
+
+def increment_forum_url(url):
+    import re
+    # If already has &page=N, increment N
+    match = re.search(r'([?&]page=)(\d+)', url)
+    if match:
+        prefix, page_num = match.groups()
+        next_page = int(page_num) + 1
+        return re.sub(r'([?&]page=)\d+', f'{prefix}{next_page}', url)
+    # If no &page=, add &page=2
+    if '&' in url:
+        return url + '&page=2'
+    else:
+        return url + '?page=2'
+
+def flatten_visited_pages(visited_pages):
+    flat = []
+    for item in visited_pages:
+        if isinstance(item, list):
+            flat.extend(flatten_visited_pages(item))
+        elif isinstance(item, str):
+            flat.append(item)
+    return flat
+
+def safe_get(url):
+    global driver
+    try:
+        driver.get(url)
+    except (NoSuchWindowException, WebDriverException):
+        print("[INFO] Driver window lost, recreating driver...")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        driver = make_new_driver()
+        driver.get(url)
+
+def safe_page_source(max_wait=30, check_interval=1):
+    """
+    Try to get driver.page_source, waiting up to max_wait seconds,
+    checking every check_interval seconds before giving up and recreating the driver.
+    """
+    global driver
+    waited = 0
+    while waited < max_wait:
+        try:
+            return driver.page_source
+        except (NoSuchWindowException, WebDriverException):
+            print("[INFO] Driver window lost when accessing page_source, recreating driver...")
+            break
+        except Exception as e:
+            print(f"[INFO] Exception while accessing page_source: {e}. Waiting {check_interval}s before retrying...")
+            time.sleep(check_interval)
+            waited += check_interval
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    driver = make_new_driver()
+    return driver.page_source
+
+def wait_for_element(by, value, timeout=8):
+    global driver
+    try:
+        WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, value)))
+    except Exception as e:
+        print(f"[WARNING] Timeout waiting for element {value}: {e}")
+
+def scrape_forum():
+    global next_thread_number
+    global driver
+    progress = load_progress()
+    visited_pages = set(flatten_visited_pages(progress["visited_pages"]))
+    forum_url = progress["last_forum_url"]
+    replies_idx = 4
+    views_idx = 5
+    
+    # Target thread count to match stormfront
+    TARGET_THREAD_COUNT = 1825
+    
+    # Check if we've already reached the target
+    if len(all_data) >= TARGET_THREAD_COUNT:
+        print(f"[INFO] Already reached target thread count of {TARGET_THREAD_COUNT}. Current count: {len(all_data)}")
+        return
+    
+    # If the last forum page is already visited, increment to the next page
+    if forum_url in visited_pages:
+        print(f"[INFO] Last forum page {forum_url} already visited. Incrementing to next page...")
+        forum_url = increment_forum_url(forum_url)
+        print(f"[INFO] Starting from next forum page: {forum_url}")
+    print(f"[INFO] Resuming from forum URL: {forum_url}")
+    print(f"[INFO] Already visited {len(visited_pages)} pages")
+    print(f"[INFO] Target thread count: {TARGET_THREAD_COUNT}, Current count: {len(all_data)}")
+    
+    while forum_url and forum_url not in visited_pages:
+        # Check if we've reached the target
+        if len(all_data) >= TARGET_THREAD_COUNT:
+            print(f"[INFO] Reached target thread count of {TARGET_THREAD_COUNT}. Stopping scraper.")
+            break
+            
+        # Manually skip the problematic page
+        if forum_url == "https://vnnforum.com/forumdisplay.php?f=57&order=desc&page=57":
+            print(f"[INFO] Skipping problematic forum page: {forum_url}")
+            forum_url = increment_forum_url(forum_url)
+            continue
+        print(f"[INFO] Scraping forum page: {forum_url}")
+        safe_get(str(forum_url))
+        wait_for_element(By.CSS_SELECTOR, "tbody[id^='threadbits_forum_']")
+        # Immediately extract data and proceed
+        soup = BeautifulSoup(safe_page_source(), 'html.parser')
+        visited_pages.add(forum_url)
+        threadbits = soup.find('tbody', id=re.compile(r'threadbits_forum_\d+'))
+        if not threadbits:
+            print("[ERROR] Could not find threadbits tbody.")
+            save_progress(forum_url, visited_pages)
+            break
+        rows = threadbits.find_all('tr', recursive=False)  # type: ignore
+        print(f"[DEBUG] Found {len(rows)} thread rows.")
+        if rows:
+            first_row_tds = [td.get_text(strip=True) for td in rows[0].find_all('td')]  # type: ignore
+            print(f"[DEBUG] First thread row columns: {first_row_tds}")
+        for row in rows:
+            # Check if we've reached the target before processing each thread
+            if len(all_data) >= TARGET_THREAD_COUNT:
+                print(f"[INFO] Reached target thread count of {TARGET_THREAD_COUNT}. Stopping scraper.")
+                break
+                
+            if isinstance(row, Tag):
+                tds = row.find_all('td')
+                tds = [td for td in tds if isinstance(td, Tag)]
+                if len(tds) <= max(replies_idx, views_idx, 1):
+                    continue
+                try:
+                    replies = int(re.sub(r'[^\d]', '', tds[replies_idx].get_text()))
+                    views = int(re.sub(r'[^\d]', '', tds[views_idx].get_text()))
+                except Exception as e:
+                    print(f"[DEBUG] Could not parse replies/views: {e}")
+                    continue
+                print(f"[DEBUG] Parsed replies: {replies}, views: {views}")
+                # Only process if tds are Tag objects and have class 'alt1' (class is a list)
+                alt1_cells = []
+                for td in tds:
+                    if isinstance(td, Tag):
+                        td_class = td.get('class')
+                        if isinstance(td_class, list) and 'alt1' in td_class:
+                            alt1_cells.append(td)
+                if len(alt1_cells) < 2:
+                    print("[DEBUG] Not enough alt1 cells in row, skipping.")
+                    continue
+                title_cell = alt1_cells[1]
+                print(f"[DEBUG] Thread title cell HTML: {title_cell}")
+                links = title_cell.find_all('a') if isinstance(title_cell, Tag) else []
+                print(f"[DEBUG] Found {len(links)} <a> tags in thread title cell.")
+                for link in links:
+                    print(f"[DEBUG] Link HTML: {link}")
+                thread_url = None
+                thread_title = None
+                for link in links:
+                    if not isinstance(link, Tag):
+                        continue
+                    href = link.get('href', '')
+                    is_thread_link = link.has_attr('id') and str(link['id']).startswith('thread_title_')
+                    match = re.search(r'showthread\.php\?t=\d+', str(href))
+                    has_img = link.find('img')
+                    if (is_thread_link or match) and not has_img:
+                        thread_url = str(href)
+                        thread_title = link.get_text(strip=True)
+                        break
+                # Only proceed if thread has 20 or more replies (after thread_title is defined)
+                if replies < 20:
+                    print(f"[INFO] Skipping thread with {replies} replies (less than 20): {thread_title}")
+                    continue
+                if thread_url:
+                    if not thread_url.startswith('http'):
+                        thread_url = "https://vnnforum.com/" + thread_url.lstrip('/')
+                    thread_id = re.search(r'threadid=(\d+)', str(thread_url))
+                    thread_id = thread_id.group(1) if thread_id else thread_url
+                    # Manually skip the problematic threads
+                    if thread_url == "https://vnnforum.com/showthread.php?t=551933":
+                        print(f"[INFO] Skipping problematic thread: {thread_url}")
+                        continue
+                    if thread_url == "https://vnnforum.com/showthread.php?t=557024":
+                        print(f"[INFO] Skipping problematic thread: {thread_url}")
+                        continue
+                    thread_already_scraped = any(
+                        thread.get("original_id") == thread_id for thread in all_data.values()
+                    )
+                    if thread_already_scraped:
+                        print(f"[DEBUG] Already scraped thread {thread_id}, skipping.")
+                        continue
+                    # --- NEW: Robust retry logic for loading thread page ---
+                    max_retries = 3
+                    for attempt in range(1, max_retries + 1):
+                        try:
+                            safe_get(thread_url)
+                            wait_for_element(By.CSS_SELECTOR, "table[id^='post']")
+                            thread_soup = BeautifulSoup(safe_page_source(), 'html.parser')
+                            main_post_date = extract_main_post_date_from_thread(thread_soup)
+                            print(f"[DEBUG] Main post date: {main_post_date}")
+                            if not is_thread_old_enough(main_post_date):
+                                print(f"[DEBUG] Skipping thread - main post date {main_post_date} is not old enough")
+                                driver.back()
+                                time.sleep(2)
+                                break
+                            # If we get here, we succeeded
+                            break
+                        except Exception as e:
+                            print(f"[DEBUG] Attempt {attempt} failed for thread {thread_url}: {e}")
+                            if attempt == max_retries:
+                                print(f"[WARNING] Skipping thread {thread_url} after {max_retries} failed attempts.")
+                                driver.back()
+                                time.sleep(2)
+                                main_post_date = None
+                                break
+                            else:
+                                time.sleep(5)  # Wait a bit before retrying
+                    if main_post_date is None or not is_thread_old_enough(main_post_date):
+                        continue
+                    # --- END NEW ---
+                    print(f"[INFO] Scraping thread: {thread_title} (Replies: {replies}, Views: {views}) @ {thread_url}")
+                    thread_data = scrape_thread_with_timeout(thread_url)
+                    if thread_data:
+                        thread_number = str(next_thread_number)
+                        all_data[thread_number] = {
+                            "original_id": thread_id,
+                            "title": thread_title,
+                            "url": thread_url,
+                            "post_date": main_post_date,
+                            "replies": replies,
+                            "views": views,
+                            "scraped_replies": thread_data["replies"],
+                            "main_post": thread_data["main_post"]
+                        }
+                        next_thread_number += 1
+                        save_data()
+                        print(f"[INFO] Thread {thread_number} scraped. Total threads: {len(all_data)}/{TARGET_THREAD_COUNT}")
+                    print(f"[DEBUG] Going back to forum page after scraping thread {thread_id}")
+                    driver.back()
+                    time.sleep(1)
+        
+        # Check if we've reached the target after processing the page
+        if len(all_data) >= TARGET_THREAD_COUNT:
+            print(f"[INFO] Reached target thread count of {TARGET_THREAD_COUNT}. Stopping scraper.")
+            break
+            
+        save_progress(forum_url, visited_pages)
+        print("[DEBUG] Navigating to next forum page...")
+        forum_url = get_next_page_url(soup)
+        if forum_url in visited_pages:
+            print("[INFO] Already visited this page, stopping to avoid loop.")
+            break
+    print(f"[INFO] Finished scraping forum. Total threads scraped: {len(all_data)}")
+    save_data()
+    save_progress(forum_url, visited_pages)
+
+def run_scraper():
+    import time
+    global driver
+    TARGET_THREAD_COUNT = 1825
+    
+    print(f"[INFO] Starting vanguard scraper. Target: {TARGET_THREAD_COUNT} threads, Current: {len(all_data)} threads")
+    
+    while True:
+        try:
+            scrape_forum()
+            # Check if we've reached the target
+            if len(all_data) >= TARGET_THREAD_COUNT:
+                print(f"[INFO] Successfully reached target thread count of {TARGET_THREAD_COUNT}!")
+                print(f"[INFO] Final thread count: {len(all_data)}")
+                break
+            else:
+                print(f"[INFO] Scraping completed but target not reached. Current: {len(all_data)}, Target: {TARGET_THREAD_COUNT}")
+                break
+        except KeyboardInterrupt:
+            print("\n[INFO] Script interrupted by user. Saving progress...")
+            try:
+                progress = load_progress()
+                visited_pages = set(flatten_visited_pages(progress["visited_pages"]))
+                forum_url = progress["last_forum_url"]
+                save_progress(forum_url, visited_pages)
+            except Exception:
+                pass
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            break  # Exit loop on user interrupt
+        except Exception as e:
+            print(f"\n[ERROR] Unexpected error: {e}")
+            print("[INFO] Attempting to save progress and restart in 10 seconds...")
+            try:
+                progress = load_progress()
+                visited_pages = set(flatten_visited_pages(progress["visited_pages"]))
+                forum_url = progress["last_forum_url"]
+                save_progress(forum_url, visited_pages)
+            except Exception:
+                pass
+            try:
+                driver.quit()
+                print("[DEBUG] Called driver.quit() after run_scraper error.")
+            except Exception:
+                print("[DEBUG] Exception during driver.quit() after run_scraper error.")
+                pass
+            driver = make_new_driver()
+            print("[DEBUG] Created new driver after run_scraper error.")
+            time.sleep(10)  # Wait before restarting
+            
+            # Check if we've reached the target after error recovery
+            if len(all_data) >= TARGET_THREAD_COUNT:
+                print(f"[INFO] Successfully reached target thread count of {TARGET_THREAD_COUNT} after error recovery!")
+                print(f"[INFO] Final thread count: {len(all_data)}")
+                break
+
+if __name__ == "__main__":
+    run_scraper() 
